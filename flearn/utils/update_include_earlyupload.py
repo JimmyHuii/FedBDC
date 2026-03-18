@@ -1,0 +1,567 @@
+import os
+
+import torch
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+from flearn.utils.model_util import diff_model, get_model_like_tensor, update_model_stability, \
+    calc_num_stable_params, recover_model_from_mask, random_mask, and_mask, \
+    threshold_mask, ratio_mask, or_mask, topK, calculate_sum, calculate_error, both_mask, reverse_mask, topK_new, bottomK, calculate_upload_interval, \
+    nextK, update_model_stability_ignore_frozen_by_ratio, calculate_sum_with_mask, calculate_multiple_upload_intervals, topK_exclude
+from flearn.utils.util import save_result
+import copy
+
+from utils.get_flops import get_flops, get_layers_name
+from itertools import islice
+
+import random
+
+class DatasetSplit(Dataset):
+    """
+    An abstract Dataset class wrapped around Pytorch Dataset class.
+    """
+
+    def __init__(self, dataset, idxs):
+        self.dataset = dataset
+        self.idxs = [int(i) for i in idxs]
+
+    def __len__(self):
+        return len(self.idxs)
+
+    def __getitem__(self, item):    # 定义了__getitem__函数，则其实例对象能够通过下标来进行索引数据。
+        image, label = self.dataset[self.idxs[item]]
+        return torch.tensor(image), torch.tensor(label)
+
+
+class LocalUpdate(object):
+    def __init__(self, args, dataset, idxs, device, local_bs=None, local_ep=None, logger=None, iter=None):
+        self.args = args
+        self.local_bs = local_bs if local_bs is not None else args.local_bs #？
+        self.local_ep = local_ep if local_ep is not None else args.local_ep #？
+        self.logger = logger
+        self.trainloader = self.train_val_test(dataset, list(idxs))
+        self.testloader = self.trainloader
+        self.device = device
+        # Default criterion set to NLL loss function
+        self.criterion = nn.CrossEntropyLoss().to(self.device)
+
+        self.iter = iter
+
+        # 定义模型名称
+        self.model_name = self.args.model
+
+    def train_val_test(self, dataset, idxs):
+        """
+        Returns train, validation and test dataloaders for a given dataset
+        and user indexes.
+        """
+        # split indexes for train, validation, and test (80, 10, 10)
+        idxs_train = idxs
+        # idxs_val = idxs[int(0.8*len(idxs)):int(0.9*len(idxs))]
+        # idxs_test = idxs[int(0.9*len(idxs)):]
+
+        trainloader = DataLoader(DatasetSplit(dataset, idxs_train), #？
+                                 batch_size=self.local_bs, shuffle=True)
+        # validloader = DataLoader(DatasetSplit(dataset, idxs_val),
+        #                          batch_size=int(len(idxs_val)/10), shuffle=False)
+        # testloader = DataLoader(DatasetSplit(dataset, idxs_test),
+        #                         batch_size=int(len(idxs_test)/10), shuffle=False)
+        return trainloader
+
+    def update_model(self, model, client_weights):
+        # 当前模型
+        cur_w = copy.deepcopy(model.state_dict())
+        pre_w = copy.deepcopy(client_weights[-1])
+        former_w = copy.deepcopy(client_weights[-2])
+
+        mask = get_model_like_tensor(model, dtype=torch.int64)
+        topK(former_w, pre_w, 0.5, mask)
+        recover_model_from_mask(pre_w, former_w, mask)
+
+        # ratio = 0.5
+        # 随机选择
+        # mask = random_mask(ratio, pre_w)
+
+        # topK选择
+        # mask = get_model_like_tensor(model, dtype=torch.int64)
+        topK(pre_w, cur_w, 0.5, mask)
+        recover_model_from_mask(cur_w, pre_w, mask)
+
+        return cur_w
+
+    def find_last_linear_layer(self, model):
+        """自动检测模型中的最后一个 nn.Linear 层"""
+        last_linear = None
+        last_linear_name = None
+        # for name, module in self.model.named_modules():
+        for name, module in model.named_modules():
+            if isinstance(module, nn.Linear):
+                last_linear = module
+                last_linear_name = name
+        if last_linear is None:
+            raise ValueError("No nn.Linear layer found in the model.")
+        return last_linear, last_linear_name
+
+    def freeze_except_last_layer(self, model):
+        """冻结所有参数，仅对最后一层开启自动求导"""
+        # 1. 冻结所有参数
+        # for param in self.model.parameters():
+        for param in model.parameters():
+            param.requires_grad = False
+
+        # 2. 找到最后一个 nn.Linear 层
+        last_linear, last_linear_name = self.find_last_linear_layer(model)
+        print(f"Detected last layer: {last_linear_name} ({last_linear})")
+
+        # 3. 只对最后一层开启自动求导
+        for param in last_linear.parameters():
+            param.requires_grad = True
+
+    def get_optimizer(self, model):
+        """根据 self.args.optim 设置优化器"""
+        if self.args.optim == 'sgd':
+            return torch.optim.SGD(
+                # filter(lambda p: p.requires_grad, self.model.parameters()),
+                # lr=self.args.lr
+                filter(lambda p: p.requires_grad, model.parameters()),
+                lr = self.args.lr
+            )
+        elif self.args.optim == 'sgdm':
+            return torch.optim.SGD(
+                # filter(lambda p: p.requires_grad, self.model.parameters()),
+                # lr=self.args.lr,
+                # momentum=0.9
+                filter(lambda p: p.requires_grad, model.parameters()),
+                lr=self.args.lr,
+                momentum=0.9
+            )
+        else:
+            raise ValueError(f"Unsupported optimizer: {self.args.optim}")
+
+
+
+    def update_weights(self, model, global_round, speed_comm, t_train, layers_diff_epochs=[], global_mask=None, error=None, all_train_weights = None):
+        # Set mode to train model
+        """
+        使用判断稳定性的模型
+        需要一个参数来记录 E_k, 和 E_k^{abs}.
+        E_k = alpha * E_{k - 1} + (1 - alpha)delta_k
+        E_k^{abs} = alpha * E_{k-1}^{abs} + (1 - alpha)|delta_k|
+        其中 delta_k 是距离上次检查的差值
+        我们定义一个函数，该函数可以基于本次模型和上次模型，更新E_k和E_k^{abs},该函数需要传入前后两个的模型参数，以及E_k和E_k^{abs}
+        之后，我们再定义一个函数，该函数为我们得到一个mask，1表示相应的参数趋于稳定了，0表示该参数仍然不稳定。该函数需要传输E_k和E_k^{abs}
+        P_k = |E_k| / E_k^{abs}
+        第一次，我们不对模型进行任何处理，只统计稳定的参数个数
+        """
+        # 用于全局冻结的，每次迭代都恢复这些全局冻结参数，表示这些全局冻结参数不参与更新
+        init_w = copy.deepcopy(model.state_dict())                 # 将模型中的所有参数复制
+        cur_w = copy.deepcopy(model.state_dict())
+        alpha = 0.99    # 平滑因子 smooth factor
+        threshold = 0.05
+        E = get_model_like_tensor(model)
+        E_abs = get_model_like_tensor(model)
+        mask = get_model_like_tensor(model, dtype=torch.int64)  # 初始化全0
+        mask_is_frozen = get_model_like_tensor(model, dtype=torch.int64)
+        L = get_model_like_tensor(model)
+        I = get_model_like_tensor(model)
+
+        u = get_model_like_tensor(model)    #上传的模型在更新后的变化差值
+        # print(error)
+
+        # # 打印模型名称
+        # print(f"model {self.model_name}", end=" ")
+        #
+        # # 定义训练时间
+        # if self.model_name == 'cnn':
+        #     t_train = 1
+        # else:
+        #     t_train = 80
+        # print(f"t_train {t_train}s", end=" ")
+
+        check_interval = 10
+        frozen_ratio = 0.2
+        ratio_down = 0.5
+
+        if self.model_name == "cnn":
+            final_ratio = 0.683
+            base_size = 122570
+        elif self.model_name == "vgg":
+            final_ratio = 0.555
+            base_size = 9750922
+        elif self.model_name == "resnet":
+            final_ratio = 0.477
+            base_size = 6568640
+
+        # upload_ratio = [0.1, 0.4]
+        upload_ratio = [0.1]
+
+        # 在某个特性的iter进行上传，我们记录这时候的模型参数，以及mask
+        upload_iter = self.args.upload_iter
+        upload_interval = []
+
+        record_w = copy.deepcopy(model.state_dict())
+
+        record_mask = get_model_like_tensor(model, dtype=torch.int64)
+
+        u1 = get_model_like_tensor(model, dtype=torch.int64)
+
+        model.train()
+        # print(model.state_dict())
+        epoch_loss = []
+
+        # Set optim for the local updates
+        # if self.args.optim == 'sgd':
+        #     optimizer = torch.optim.SGD(model.parameters(), lr=self.args.lr)
+        # elif self.args.optim == "sgdm":
+        #     optimizer = torch.optim.SGD(model.parameters(), lr=self.args.lr, momentum=0.9)
+
+        # 如果 freeze_except_last=True，冻结除最后一层外的参数
+        if self.args.freeze_except_last:
+            self.freeze_except_last_layer(model)
+
+        # 设置优化器（只优化 requires_grad=True 的参数）
+        optimizer = self.get_optimizer(model)
+
+        # 使用 epoch 来进行更新
+        if self.iter is None: # self.iter = local_iter
+            print("local_iter is none")
+            for epoch in range(self.local_ep):
+                batch_loss = []
+                w1 = copy.deepcopy(model.state_dict())
+                for batch_idx, (images, labels) in enumerate(self.trainloader):
+                    images, labels = images.to(self.device), labels.to(self.device)
+                    model.zero_grad()
+                    log_probs = model(images)
+                    loss = self.criterion(log_probs, labels)
+                    loss.backward()
+                    optimizer.step()
+
+                    if self.args.verbose and (batch_idx % 10 == 0): #？
+                        print('| Global Round : {} | Local Epoch : {} | [{}/{} ({:.0f}%)]\tLoss: {:.6f}'.format(
+                            global_round, iter, batch_idx * len(images),
+                            len(self.trainloader.dataset),
+                                                100. * batch_idx / len(self.trainloader), loss.item()))
+                    batch_loss.append(loss.item())
+                layers_diff = diff_model(w1, model.state_dict())    # 计算两个模型各层的差异
+                layers_diff_epochs.append(layers_diff)  # 每一个epoch结束后的差异?iter更新没有
+                epoch_loss.append(sum(batch_loss) / len(batch_loss))    # 将一个epoch中每个batch_loss平均
+
+
+        # 使用 iter 来进行更新
+        else:
+            iter = 0
+            upload_index = 0    # 表示当前上传的比例在列表中的位置
+            total_upload_ratio = 0
+
+            total_batches = len(self.trainloader)
+            print(" len trainloader", total_batches, end=" ")
+            desired_batches_per_epoch = self.iter
+
+
+            # 计算开始上传的时间
+
+            # upload_interval = calculate_multiple_upload_intervals(base_size, speed_comm, upload_ratio, t_train, self.iter)  # 返回一个数组
+            # print(f"upload_interval {upload_interval}", end=" ")
+
+            # 我们每隔 check_interval 来检测模型是否稳定
+
+            last_w = copy.deepcopy(model.state_dict())
+            while iter < self.iter:     # self.iter指代本地执行的iter总数
+                batch_loss = []
+
+                # # 计算这一轮要使用的 batch 范围
+                # start_batch = (iter % total_batches)  # 从当前 iter 所在轮次开始
+                # end_batch = start_batch + desired_batches_per_epoch
+                # # 根据奇偶性决定使用数据集的前半部分还是后半部分
+                # if (global_round + 1) % 2 == 0:
+                #     # 双数轮，使用数据集的后半部分
+                #     start_batch += total_batches // 2
+                #     end_batch += total_batches // 2
+
+                # 每轮随机选择 250 个 batch 索引
+                all_indices = list(range(total_batches))
+                selected_indices = random.sample(all_indices, desired_batches_per_epoch)
+                selected_indices.sort()  # 保持顺序
+
+                # 计算 start_batch 和 end_batch
+                start_batch = selected_indices[0]
+                end_batch = selected_indices[-1] + 1
+
+
+
+                for batch_idx, (images, labels) in enumerate(islice(self.trainloader, start_batch, end_batch)): # 顺序批次
+                # for batch_idx, (images, labels) in enumerate(self.trainloader): # 把local_iter改为500
+                    # 检查当前 batch 是否在选中列表中
+                    current_batch_global = start_batch + batch_idx
+                    if current_batch_global not in selected_indices:
+                        continue  # 跳过非选中的 batch
+                    images, labels = images.to(self.device), labels.to(self.device)
+                    model.zero_grad()
+                    log_probs = model(images)
+                    loss = self.criterion(log_probs, labels)
+                    loss.backward()
+
+                    optimizer.step()
+
+                    batch_loss.append(loss.item())
+                    iter += 1
+
+                    # 进行稳定性检查， 每次检查完毕后，就要变化上一个模型参数
+                    # if iter % check_interval == 0 and iter < upload_interval:
+                    #     # 在进行稳定性检查时也加上error
+                    #     update_model_stability(last_w, model.state_dict(), E, E_abs, mask_is_frozen, alpha)
+                    #     last_w = copy.deepcopy(model.state_dict())
+                    #     ratio_mask(E, E_abs, mask_is_frozen, upload_ratio)
+
+                        # 检查稳定性时考虑冻结参数  该冻结方法根据比率确定
+                        # update_model_stability_ignore_frozen_by_ratio(last_w, calculate_sum(model.state_dict(), error), E, E_abs, mask_is_frozen, L, I, iter, check_interval, alpha, frozen_ratio)
+                        # # update_model_stability_ignore_frozen_by_ratio(last_w, model.state_dict(), E, E_abs,
+                        # #                                               mask, L, I, iter, check_interval, alpha,
+                        # #                                               frozen_ratio)
+                        # last_w = copy.deepcopy(model.state_dict())
+
+                    # 根据mask_is_frozen进行冻结,在每一次iteration更新中，只更新没有冻结的位置的参数
+                    # init_w = copy.deepcopy(cur_w)
+                    # cur_w = copy.deepcopy(model.state_dict())
+                    # recover_model_from_mask(cur_w, init_w, mask_is_frozen)
+                    # model.load_state_dict(cur_w)
+
+                    # 获取指定迭代的模型和mask
+                    # if iter in upload_interval and iter != self.iter:
+                    #     # threshold_mask(E, E_abs, mask, threshold)
+                    #
+                    #     w0 = copy.deepcopy(record_w)
+                    #     record_w1 = calculate_sum(model.state_dict(), error)  # 不加误差
+                    #
+                    #     # 根据稳定性上传
+                    #     # ratio_mask(E, E_abs, mask, upload_ratio)    # 根据稳定性来确定上传的mask
+                    #     # recover_model_from_mask(record_w, record_w1, mask)  # 根据mask变化record_w
+                    #     # u1 = calculate_error(record_w, w0)  # 计算record_w和w0之间的差异
+                    #     # record_mask = or_mask(record_mask, mask)    # 记录每个上传过的位
+                    #
+                    #     #
+                    #     # record_w = copy.deepcopy(model.state_dict())
+                    #     # record_mask = copy.deepcopy(mask)
+                    #
+                    #     # random uploading
+                    #     mask = random_mask(upload_ratio[upload_index], record_w1)
+                    #     recover_model_from_mask(record_w, record_w1, mask)
+                    #     u = calculate_sum(calculate_error(record_w, w0), u)
+                    #     upload_index += 1
+                    #     record_mask = or_mask(record_mask, mask)
+                    #
+                    #     # u1 = calculate_error(record_w, w0)
+                    #     # record_mask = copy.deepcopy(mask)
+                    #
+                    #     # topk early uploading
+                    #     # topK(record_w, record_w1, (1 - upload_ratio[upload_index]), mask)
+                    #     # mask = reverse_mask(mask)
+                    #     # recover_model_from_mask(record_w, record_w1, mask)
+                    #     # # u1 = calculate_error(record_w, w0)  # 计算record_w和w0之间的差异
+                    #     # u = calculate_sum(calculate_error(record_w, w0), u)
+                    #     # upload_index += 1
+                    #     # record_mask = copy.deepcopy(reverse_mask(mask))
+                    #
+                    #     # nextK early uploading
+                    #     # if upload_ratio + final_ratio == 1:
+                    #     #     topK(record_w, record_w1, upload_ratio, mask)
+                    #     #     recover_model_from_mask(record_w, record_w1, mask)
+                    #     # else:
+                    #     #     nextK(record_w, record_w1, (1 - upload_ratio - final_ratio), 1 - final_ratio, mask)
+                    #     #     mask = reverse_mask(mask)
+                    #     #     recover_model_from_mask(record_w, record_w1, mask)
+                    #     # # recover_model_from_mask(record_w, w0, mask_is_frozen)   # 冻结参数的位置不上传
+                    #     # u1 = calculate_error(record_w, w0)  # 计算record_w和w0之间的差异
+                    #     # record_mask = copy.deepcopy(reverse_mask(mask))
+                    #
+                    #     # nextK multiple early uploadings
+                    #     # 计算索引位置之前的和
+                    #     # sum_before = sum(upload_ratio[:upload_index])
+                    #     # # 计算索引位置之后的和
+                    #     # sum_after = sum(upload_ratio[upload_index + 1:]) + final_ratio
+                    #     # # 计算当前索引到列表末尾的和
+                    #     # sum_current_to_end = sum(upload_ratio[upload_index:]) + final_ratio
+                    #     # if sum(upload_ratio) + final_ratio == 1:
+                    #     #     if upload_index == 0:
+                    #     #         topK(record_w, record_w1 , upload_ratio[0], mask)
+                    #     #     else:
+                    #     #         nextK(record_w, record_w1, sum_before, sum_after, mask)
+                    #     #         mask = reverse_mask(mask)
+                    #     # else:
+                    #     #     nextK(record_w, record_w1, (1 - sum_current_to_end), (1 - sum_after), mask)
+                    #     #     mask = reverse_mask(mask)
+                    #     # recover_model_from_mask(record_w, record_w1, mask)
+                    #     # u = calculate_sum(calculate_error(record_w, w0), u)
+                    #     # upload_index += 1
+                    #
+                    #     # 上传被冻结的参数
+                    #     # recover_model_from_mask(record_w, record_w1, mask_is_frozen)
+                    #     # u1 = calculate_error(record_w, w0)
+                    #     # record_mask = copy.deepcopy(mask_is_frozen)
+                    #     # frozen_pct = calc_num_stable_params(mask_is_frozen)
+                    #     # print(f'ratio of frozen_pct:', frozen_pct)
+                    #
+                    #     # record_mask = copy.deepcopy(reverse_mask(mask))
+
+
+
+
+
+                    # 保持稳定后，采取冻结参数的方式进行更新
+                    # 每次更新后，将record_mask的参数给到当前模型
+                    # if iter > upload_iter:
+                    #     cur_w = model.state_dict()
+                    #     recover_model_from_mask(cur_w, record_w, record_mask)
+                    #     model.load_state_dict(cur_w)
+
+                    # 进行全局冻结
+                    # if global_mask is not None and self.args.global_mask_frozen == 1:
+                    #     cur_w = model.state_dict()
+                    #     recover_model_from_mask(cur_w, init_w, global_mask)
+                    #     model.load_state_dict(cur_w)
+
+                    # if iter >= self.iter:
+                    #     # threshold_mask(E, E_abs, mask, threshold)
+                    #     ratio_mask(E, E_abs, mask, upload_ratio)
+                    #     break
+                epoch_loss.append(sum(batch_loss) / len(batch_loss))
+
+        AMask = and_mask(record_mask, mask) # 只有在record_mask和mask中都置1的才能置1
+
+        # topK(record_w, model.state_dict(), ratio=0.2, record_mask=record_mask) #将变化大于ratio的置0，将小于ratio的置1
+        #
+        # 不进行任何的干涉，只是统计稳定参数个数的占比？
+        stable_pct_final = calc_num_stable_params(mask)
+        stable_pct_upload = calc_num_stable_params(record_mask)
+        stable_pct_dcheck = calc_num_stable_params(AMask)
+
+
+        w1 = copy.deepcopy(record_w)
+        # 在稀疏化前先加上误差得到cur_w 不存在冻结参数
+        # print(model.state_dict())
+        # print(error)
+        cur_w = calculate_sum(model.state_dict(), error)
+        # 在稀疏化前先加上误差得到cur_w
+        # cur_w = calculate_sum_with_mask(cur_w, error, mask_is_frozen)
+        w = copy.deepcopy(cur_w)
+
+
+
+        # 稀疏化
+        # exclude_topk
+        # topK_exclude(record_w, cur_w, (1 - final_ratio), mask, record_mask)
+        # recover_model_from_mask(cur_w, record_w, mask)
+
+
+        # 用topK稀疏化
+        if self.args.is_FedAvg == False:
+            topK(record_w, cur_w, (1 - self.args.final_ratio), mask)
+            recover_model_from_mask(cur_w, record_w, mask)
+
+        # recover_model_from_mask(cur_w, w1, mask_is_frozen)
+
+        # 用随机方法稀疏化
+        # mask = random_mask(final_ratio, cur_w)
+        # mask = reverse_mask(mask)
+        # recover_model_from_mask(cur_w, record_w, mask)
+
+
+
+
+
+        u = calculate_sum(calculate_error(cur_w, w1), u)
+
+        # 计算误差
+        new_error = calculate_error(w, cur_w)
+
+        # return cur_w, epoch_loss[-1], stable_pct_final, stable_pct_upload, stable_pct_dcheck, new_error
+
+        return u, epoch_loss[-1], stable_pct_final, stable_pct_upload, stable_pct_dcheck, new_error
+
+    def inference(self, model):
+        """ Returns the inference accuracy and loss.
+        """
+
+        model.eval()
+        loss, total, correct = 0.0, 0.0, 0.0
+
+        idx = 0
+        for batch_idx, (images, labels) in enumerate(self.testloader):
+            images, labels = images.to(self.device), labels.to(self.device)
+
+            # Inference
+            outputs = model(images)
+            batch_loss = self.criterion(outputs, labels)
+            loss += batch_loss.item()
+
+            # Prediction
+            _, pred_labels = torch.max(outputs, 1) #torch.max(a,1) 返回每一行中最大值的那个元素，且返回其索引（返回最大元素在这一列的列索引）
+            pred_labels = pred_labels.view(-1)
+            correct += torch.sum(torch.eq(pred_labels, labels)).item() #若predicted与label.data对应数值相同，则torch.eq()返回1，否则返回0，张量类型
+                                                                        #torch.eq(predicted,label.data).sum() 返回一个张量，张量值为对应值相同的个数
+            total += len(labels) #？
+            idx += 1
+
+        accuracy = correct / total
+        return accuracy, loss / idx
+
+if __name__ == "__main__":
+    flops, params = get_flops("vgg")
+    print(float(flops))
+    print(float(params))
+
+    upload_ratio = 0.5
+    speed_comm = 1
+    per_comm = params * 4 / 1024 / 1024  # 单个模型的字节数 MB
+    print(per_comm)
+    bitmap_comm = per_comm / 32  # 用于传输位置的字节数
+    t_comm_mid = (per_comm * upload_ratio + bitmap_comm) / speed_comm  # 中间传输需要的时间
+    print(t_comm_mid)
+
+    upload_intetval = calculate_upload_interval(params, 1, 0.5, 80, 250)
+    print(upload_intetval)
+
+    upload_ratios = [0.4, 0.5]
+    upload_intetvals = calculate_multiple_upload_intervals(params, 1, upload_ratios, 80, 250)
+    print(upload_intetvals)
+
+    my_list = [10, 20, 30, 40, 50]
+    element_to_find = 30
+
+    if element_to_find in my_list:
+        index = my_list.index(element_to_find)
+        print(f"The element {element_to_find} is found at index {index}.")
+    else:
+        print(f"The element {element_to_find} is not in the list.")
+
+    my_list = [10, 20, 30, 40, 50]
+
+    # 要查找的元素
+    element_to_find = 50
+
+    # 获取元素的索引位置
+    index_of_element = my_list.index(element_to_find)
+
+    # 计算索引位置之前的和
+    sum_before = sum(my_list[:index_of_element])
+
+    # 计算索引位置之后的和
+    sum_after = sum(my_list[index_of_element + 1:])
+
+    # 计算当前索引到列表末尾的和
+    sum_from_current_to_end = sum(my_list[index_of_element:])
+
+    print(f"The element {element_to_find} is at index: {index_of_element}")
+    print(f"Sum of elements before: {sum_before}")
+    print(f"Sum of elements after: {sum_after}")
+
+
+
+    print(f"The element {element_to_find} is at index: {index_of_element}")
+    print(f"Sum from current index to end: {sum_from_current_to_end}")
+
+    l = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1219, 0.1001, 0.1006, 0.1, 0.1659, 0.1869, 0.1858, 0.1851, 0.1872, 0.1932, 0.211, 0.2197, 0.2325, 0.2467, 0.2387, 0.2502, 0.2606, 0.2707, 0.2825, 0.281, 0.2879, 0.2927, 0.3024, 0.3221, 0.3218, 0.329, 0.3378, 0.3444, 0.3498, 0.3569, 0.37, 0.361, 0.3798, 0.3819, 0.389, 0.3997, 0.4043, 0.4059, 0.4184, 0.422, 0.4308, 0.434, 0.435, 0.4414, 0.439, 0.4483, 0.4541, 0.4617, 0.4669, 0.4762, 0.4835, 0.4923, 0.494, 0.4996, 0.5059, 0.5122, 0.5078, 0.5196, 0.5268, 0.5336, 0.531, 0.5426, 0.5431, 0.5508, 0.5497, 0.5561, 0.5624, 0.5635, 0.5675, 0.564, 0.5732, 0.5772, 0.5782, 0.5855, 0.5883, 0.5909, 0.5975, 0.6014, 0.603, 0.6028, 0.6078, 0.6116, 0.6216, 0.6236, 0.6284, 0.6288, 0.6279, 0.6314, 0.636, 0.6386, 0.6427, 0.6469, 0.6464, 0.6528, 0.6489, 0.6579, 0.6604, 0.6641, 0.6651, 0.6698, 0.6726, 0.6722, 0.6754, 0.6791, 0.6758, 0.6806, 0.6828, 0.6819, 0.6839, 0.6854, 0.6919, 0.6878, 0.6864, 0.6909, 0.6912, 0.6971, 0.6956, 0.6987, 0.6971, 0.7013, 0.7051, 0.706, 0.7064, 0.7066, 0.7053, 0.7088, 0.7125, 0.7157, 0.7182, 0.7188, 0.7178, 0.7186, 0.7215, 0.7214, 0.7254, 0.7294, 0.7277, 0.7265, 0.7229, 0.732, 0.7318, 0.731, 0.7354, 0.7374, 0.7358, 0.7394, 0.74, 0.7417, 0.7425, 0.7471, 0.7445, 0.7429, 0.7459, 0.7464, 0.7502, 0.7445, 0.7495, 0.7481, 0.7475, 0.7503, 0.751, 0.752, 0.7539, 0.7548, 0.755, 0.7528, 0.7587, 0.7571, 0.7588, 0.76, 0.7606, 0.7599, 0.7642, 0.7614, 0.7597, 0.7591, 0.7613, 0.7651, 0.7618, 0.7637, 0.7656, 0.7671, 0.7686, 0.7658, 0.7679, 0.7681, 0.767, 0.7675, 0.7677, 0.7698, 0.7688, 0.7734, 0.7722, 0.7737, 0.7759, 0.7731, 0.7747, 0.7791, 0.7742, 0.7765, 0.7777, 0.7758, 0.7765, 0.7767, 0.778, 0.7775, 0.779, 0.777, 0.7765, 0.7784, 0.7805, 0.7783, 0.7769, 0.7772, 0.7777, 0.7811, 0.7766, 0.777, 0.7779, 0.7771, 0.7786, 0.7805, 0.7801, 0.7803, 0.7811, 0.7824, 0.7837, 0.7827, 0.7824, 0.7828, 0.7836, 0.7805, 0.7826, 0.7844, 0.7821, 0.7836, 0.7836, 0.7879, 0.7831, 0.7836, 0.7848, 0.7853, 0.785, 0.7862, 0.7856, 0.7781, 0.7827, 0.7874, 0.7826, 0.7838, 0.7829, 0.7788, 0.7845, 0.7863, 0.7872, 0.7876, 0.7868, 0.7839, 0.788, 0.7902, 0.7869, 0.7866, 0.7875, 0.7861, 0.7886, 0.7862, 0.7863, 0.7838, 0.789, 0.784, 0.7869, 0.7868, 0.7896, 0.7895, 0.7905, 0.7895, 0.7869, 0.7887, 0.788, 0.7872, 0.7888, 0.7905, 0.7893, 0.7902, 0.7909, 0.79, 0.7903, 0.7886, 0.7917, 0.7909, 0.7906, 0.7911, 0.7883, 0.7876, 0.7888, 0.7918, 0.7901, 0.7904, 0.79, 0.7911, 0.7892, 0.7887, 0.7896, 0.7881, 0.7893, 0.7926, 0.7927, 0.7909, 0.7921, 0.7911, 0.7909, 0.7906, 0.7927, 0.7885, 0.7888, 0.7881, 0.789, 0.7895, 0.7881, 0.7886, 0.7884, 0.7902, 0.7883, 0.789, 0.7924, 0.792, 0.792, 0.7919, 0.7895, 0.7902, 0.7904, 0.7912, 0.7925, 0.7917, 0.7908, 0.7912, 0.7918, 0.7912, 0.7923, 0.7928, 0.7899, 0.7932, 0.7931, 0.7928, 0.791, 0.7899, 0.7887, 0.7912, 0.7917, 0.7917, 0.7922, 0.7914, 0.7915, 0.7916, 0.7907, 0.7894, 0.7899, 0.7937, 0.793, 0.7927, 0.7921, 0.7917, 0.7928, 0.7932, 0.7928, 0.7914, 0.7894, 0.7895, 0.7911, 0.7927, 0.7923, 0.7923, 0.7925, 0.7931, 0.7931, 0.7911, 0.7933, 0.7937, 0.7948, 0.7923, 0.7915, 0.7903, 0.7921, 0.7935, 0.794, 0.7939, 0.795, 0.7932, 0.7925, 0.7928, 0.794, 0.7945, 0.7936, 0.7949, 0.794, 0.7932, 0.7959, 0.7933, 0.7931, 0.7938, 0.7947, 0.7948, 0.7943, 0.7926, 0.7948, 0.7937, 0.7946, 0.7937, 0.7941, 0.7949, 0.7947, 0.7945, 0.7949, 0.7956, 0.7978, 0.7972, 0.7973, 0.7965, 0.7953, 0.7947, 0.7942, 0.7969, 0.7958, 0.7955, 0.7961, 0.7963, 0.794, 0.7963, 0.7944, 0.7953, 0.7947, 0.7964, 0.796, 0.7968, 0.7965, 0.7943, 0.7964, 0.797, 0.7934, 0.7945, 0.7948, 0.7955, 0.7977, 0.7957, 0.7952, 0.7966, 0.7984, 0.7961, 0.7956, 0.7967, 0.7974, 0.7975, 0.799, 0.7975, 0.7976, 0.7968, 0.7977, 0.7985, 0.7984, 0.7971, 0.797, 0.7973, 0.7982, 0.7987, 0.7979, 0.7989, 0.7966, 0.7974, 0.7985, 0.7963, 0.7975, 0.7981, 0.799, 0.7988, 0.7977, 0.7975, 0.7974, 0.7962, 0.7972, 0.7975, 0.7965, 0.7959, 0.796, 0.7976, 0.7963, 0.7971, 0.7974, 0.796, 0.7967, 0.7967, 0.7975, 0.7981, 0.7971, 0.7969, 0.7965, 0.7967, 0.7966, 0.7955, 0.7968, 0.796, 0.796, 0.7984, 0.7987, 0.7974, 0.7974, 0.7974, 0.7972, 0.7981, 0.8, 0.7983, 0.7981, 0.7985, 0.7985, 0.7976, 0.7984, 0.7984, 0.7981, 0.798, 0.7984, 0.7982, 0.7978, 0.7965, 0.7981, 0.7981, 0.7966, 0.7971, 0.7965, 0.7975, 0.7978, 0.7987, 0.7981, 0.7973, 0.7973, 0.7977, 0.7979, 0.7969, 0.7981, 0.7969, 0.7999, 0.7985, 0.7995, 0.7972, 0.7975, 0.7976, 0.7981, 0.7988, 0.798, 0.7976, 0.7977, 0.7983, 0.7969, 0.7973, 0.7979, 0.798, 0.7983, 0.7977, 0.7984, 0.7982, 0.7987, 0.7984, 0.7981, 0.7981, 0.7985, 0.7984, 0.798, 0.7994, 0.7993, 0.7989, 0.7988, 0.7982, 0.7986, 0.7981, 0.798, 0.7989, 0.7976, 0.7992, 0.7986, 0.7991, 0.8, 0.7984, 0.7987, 0.7978, 0.7984, 0.7978, 0.7982, 0.7976, 0.7978, 0.7981, 0.7989, 0.7982, 0.7988, 0.7987, 0.7996, 0.7992, 0.7984, 0.799, 0.7995, 0.7992, 0.7987, 0.7992, 0.7987, 0.7992, 0.7983, 0.7986, 0.7994, 0.7993, 0.7994, 0.7991, 0.7987, 0.7986, 0.7991, 0.8001, 0.8, 0.7992, 0.8006, 0.8, 0.7998, 0.8003, 0.7996, 0.8006, 0.8003, 0.7997, 0.7995, 0.7991, 0.7998, 0.7997, 0.8012, 0.8004, 0.7997, 0.7996, 0.7999, 0.7996, 0.8003, 0.8001, 0.7994, 0.7999, 0.801, 0.8002, 0.8004, 0.801, 0.8004, 0.8007, 0.8006, 0.8008, 0.8005, 0.8003, 0.8006, 0.8008, 0.8001, 0.7997, 0.8004, 0.8012, 0.8007, 0.8012, 0.8015, 0.8012, 0.8006, 0.8012, 0.8008, 0.8009, 0.8018, 0.8018, 0.8014, 0.8007, 0.801, 0.8002, 0.8004, 0.8007, 0.8013, 0.8012, 0.8004, 0.8001, 0.8002, 0.8001, 0.8005, 0.8004, 0.8004, 0.8009, 0.8012, 0.8028, 0.8021, 0.8006, 0.8009, 0.8007, 0.8009, 0.8016, 0.8018, 0.8016, 0.8015, 0.8014, 0.802, 0.8019, 0.802, 0.8016, 0.8012, 0.8013, 0.8019, 0.8011, 0.8019, 0.8014, 0.8011, 0.8018, 0.8016, 0.8023, 0.8019, 0.8019, 0.8013, 0.8024, 0.802, 0.8014, 0.8021, 0.8023, 0.8023, 0.802, 0.8019, 0.8025, 0.8021, 0.8021, 0.8024, 0.8019, 0.8014, 0.8015, 0.8022, 0.8026, 0.8025, 0.8025, 0.8024, 0.802, 0.8022, 0.8022, 0.8022, 0.8023, 0.802, 0.8021, 0.8032, 0.8021, 0.8026, 0.8027, 0.8028, 0.8028, 0.8029, 0.8025, 0.8031, 0.8025, 0.8028, 0.8024, 0.803, 0.8029, 0.8029, 0.8027, 0.8026, 0.8025, 0.8029, 0.8028, 0.8028, 0.8027, 0.8027, 0.8027, 0.8028, 0.8025, 0.8026, 0.8028, 0.803, 0.8033, 0.8032, 0.8029, 0.8029, 0.8028, 0.8031, 0.8033, 0.8033, 0.8026, 0.8027, 0.8034, 0.803, 0.8032, 0.8028, 0.803, 0.8029, 0.803, 0.8032, 0.8037, 0.8038, 0.8032, 0.8034, 0.8036, 0.803, 0.8033, 0.8032, 0.8039, 0.8035, 0.803, 0.8031, 0.8032, 0.8034, 0.8031, 0.8029, 0.803, 0.8032, 0.8034, 0.8033, 0.8031, 0.8031, 0.8031, 0.8031, 0.8035, 0.803, 0.8034, 0.8033, 0.8036, 0.8035, 0.8033, 0.8026, 0.803, 0.8027, 0.8029, 0.8031, 0.8033, 0.8029, 0.8031, 0.8033, 0.8034, 0.8037, 0.8034, 0.8034, 0.8033, 0.8036, 0.8033, 0.8038, 0.8038, 0.8038, 0.8039, 0.8038, 0.8041, 0.8033, 0.8034, 0.8037, 0.8036, 0.8038, 0.804, 0.8036, 0.804, 0.8038, 0.8035, 0.804, 0.8038, 0.8036, 0.8039, 0.8039, 0.8038, 0.8038, 0.8039, 0.8038, 0.8039, 0.8039, 0.8038, 0.804, 0.804, 0.804, 0.804, 0.8039, 0.8043, 0.8039, 0.8035, 0.8035, 0.8036, 0.8046, 0.804, 0.8043, 0.8041, 0.8042, 0.8043, 0.8044, 0.8047, 0.8048, 0.8041, 0.8044, 0.8042, 0.8042, 0.8041, 0.8045, 0.8044, 0.8045, 0.8047, 0.8045, 0.8043, 0.8039, 0.8043, 0.8041, 0.8048, 0.8045, 0.8043, 0.8046, 0.8045, 0.8045, 0.8046, 0.8044, 0.8048, 0.8047, 0.8045, 0.8048, 0.805, 0.8049, 0.8046, 0.8046, 0.805, 0.8046, 0.8044, 0.8045, 0.8047, 0.8046, 0.8046, 0.8044, 0.805, 0.8051, 0.8052, 0.8051, 0.8049, 0.8052, 0.8049, 0.8048, 0.8052, 0.8049, 0.8051, 0.805, 0.805, 0.8051, 0.805, 0.805, 0.8047, 0.8047, 0.8048, 0.8048, 0.8051, 0.8051, 0.8048, 0.8048, 0.8047, 0.8049, 0.8054, 0.8054, 0.8055, 0.8053, 0.8054, 0.8055, 0.805, 0.8055, 0.8052, 0.8051, 0.8055, 0.8055, 0.8053, 0.8056, 0.8055, 0.8055, 0.8055, 0.8057, 0.8053, 0.8056, 0.8055, 0.8053, 0.8053, 0.8054, 0.8052, 0.8052, 0.8056, 0.8054, 0.8053, 0.8054, 0.8055, 0.8054, 0.8054, 0.8053, 0.8054, 0.8055, 0.8058, 0.8059, 0.8058, 0.806, 0.8058, 0.8059, 0.8059, 0.8059, 0.8058, 0.8059, 0.8059, 0.8058, 0.8058, 0.8058, 0.8058, 0.8059, 0.8056, 0.8057, 0.8057, 0.8055, 0.8058, 0.8057, 0.8058, 0.8058, 0.8057, 0.8057, 0.8058, 0.8058, 0.8057, 0.8057, 0.8058, 0.8058, 0.8058, 0.8059, 0.8057, 0.8058, 0.8059, 0.8059, 0.8057, 0.8058, 0.8058, 0.8056, 0.8055, 0.8056, 0.8056, 0.8058, 0.8056, 0.8056, 0.8058, 0.8058, 0.8059, 0.8059, 0.8058, 0.8056, 0.8057, 0.8057, 0.8057, 0.806, 0.8058, 0.8061, 0.8057, 0.8058, 0.8058, 0.806, 0.8061, 0.8062, 0.806, 0.8058, 0.806, 0.806, 0.8063, 0.8062, 0.8062, 0.8061, 0.8066, 0.8063, 0.8062, 0.8064, 0.8066, 0.8066, 0.8065, 0.8066, 0.8066, 0.8065, 0.8066, 0.8065, 0.8066, 0.8068, 0.8068, 0.8065, 0.8067, 0.8068, 0.8067, 0.8067, 0.8067, 0.8067, 0.8068, 0.8068, 0.8066, 0.8066, 0.8066, 0.8067, 0.8068, 0.8067, 0.8066, 0.8067, 0.8067, 0.8067, 0.8066, 0.8066, 0.8067, 0.8068, 0.8068, 0.8067, 0.8069, 0.8068, 0.8068, 0.8069, 0.8069, 0.8067, 0.8068, 0.8067, 0.8068, 0.807, 0.807, 0.8071, 0.8071, 0.807, 0.8071, 0.8071, 0.8071, 0.8071, 0.807, 0.8071, 0.8071, 0.8071, 0.807, 0.807, 0.8071, 0.8071, 0.8071, 0.8071, 0.8071, 0.8071, 0.8071, 0.8069, 0.807, 0.807, 0.8071, 0.8071, 0.8071, 0.8071, 0.8068, 0.8068, 0.8068, 0.8071, 0.807, 0.807, 0.807, 0.807, 0.807, 0.807, 0.8069, 0.8069, 0.8069, 0.8069, 0.807, 0.8071, 0.8071, 0.807, 0.807, 0.8069, 0.807, 0.807, 0.807, 0.8071, 0.8071, 0.807, 0.807, 0.807, 0.807, 0.807, 0.8069, 0.8069, 0.8069, 0.8069, 0.807, 0.8069, 0.807, 0.807, 0.807, 0.8069, 0.8069, 0.807, 0.807, 0.807, 0.8071, 0.8072, 0.8072, 0.807, 0.807, 0.807, 0.8071, 0.807, 0.807, 0.807, 0.807, 0.807, 0.8071, 0.8071, 0.807, 0.8071, 0.8071, 0.8068, 0.8068, 0.807, 0.8071, 0.807, 0.807, 0.807, 0.8071, 0.807, 0.8069, 0.8069, 0.8069, 0.8069, 0.807, 0.8069, 0.8069, 0.807, 0.807, 0.8071, 0.8071, 0.8072, 0.8072, 0.8072, 0.8072, 0.8072, 0.8071, 0.8071, 0.8071, 0.8071, 0.8071, 0.8071, 0.8072, 0.8072, 0.8071, 0.8071, 0.8071, 0.8071, 0.8071, 0.807, 0.807, 0.807]
+    print(len(l))
+
+    l1 = [0.1, 0.1017, 0.1125, 0.1841, 0.2102, 0.2253, 0.2845, 0.2942, 0.303, 0.3379, 0.3622, 0.3691, 0.3804, 0.422, 0.4253, 0.4365, 0.4654, 0.471, 0.4559, 0.4802, 0.4919, 0.4861, 0.5029, 0.51, 0.5048, 0.5117, 0.524, 0.5323, 0.5346, 0.5399, 0.5502, 0.5512, 0.5573, 0.5642, 0.5708, 0.5701, 0.5743, 0.5705, 0.5798, 0.5874, 0.5824, 0.5848, 0.5952, 0.6001, 0.6048, 0.6061, 0.6068, 0.6074, 0.6077, 0.6175, 0.6212, 0.6202, 0.62, 0.6228, 0.6281, 0.6242, 0.6287, 0.6336, 0.6362, 0.6387, 0.6379, 0.6381, 0.6375, 0.6448, 0.6455, 0.6484, 0.6465, 0.6497, 0.6532, 0.6574, 0.6522, 0.655, 0.6559, 0.6567, 0.6552, 0.6614, 0.6597, 0.6605, 0.659, 0.6612, 0.6663, 0.663, 0.6664, 0.6666, 0.6689, 0.6684, 0.6658, 0.6682, 0.6731, 0.6772, 0.6754, 0.6765, 0.6712, 0.6752, 0.6765, 0.6803, 0.682, 0.6791, 0.6804, 0.6789, 0.6828, 0.6812, 0.6867, 0.685, 0.6855, 0.6892, 0.687, 0.6916, 0.687, 0.6909, 0.6923, 0.6872, 0.6922, 0.6921, 0.694, 0.6929, 0.6949, 0.6977, 0.6965, 0.6933, 0.6965, 0.7023, 0.6985, 0.6964, 0.7011, 0.7004, 0.6995, 0.7008, 0.7031, 0.7, 0.7012, 0.7015, 0.7015, 0.7045, 0.7037, 0.7019, 0.7061, 0.7069, 0.7035, 0.7062, 0.7051, 0.7035, 0.7064, 0.7068, 0.7052, 0.7045, 0.7033, 0.7097, 0.7068, 0.7091, 0.7069, 0.7094, 0.7101, 0.7104, 0.7125, 0.7127, 0.7095, 0.7141, 0.7149, 0.7161, 0.714, 0.7166, 0.7135, 0.7145, 0.7173, 0.7196, 0.7165, 0.7137, 0.7144, 0.716, 0.7181, 0.7147, 0.7149, 0.715, 0.7166, 0.7177, 0.72, 0.7188, 0.716, 0.7187, 0.7211, 0.7182, 0.7157, 0.719, 0.7207, 0.72, 0.7172, 0.7221, 0.7255, 0.7196, 0.7238, 0.7227, 0.7234, 0.7212, 0.7199, 0.7244, 0.7222, 0.7219, 0.7236, 0.7246, 0.7188, 0.7236, 0.718, 0.7213, 0.7233, 0.727, 0.7253, 0.7248, 0.7239, 0.7226, 0.7185, 0.7261, 0.7255, 0.7263, 0.7273, 0.7255, 0.7223, 0.7262, 0.7264, 0.726, 0.7258, 0.7279, 0.7257, 0.7281, 0.7297, 0.7266, 0.7265, 0.7242, 0.7307, 0.7268, 0.7267, 0.7301, 0.7286, 0.7252, 0.7248, 0.7267, 0.7263, 0.7258, 0.7297, 0.7279, 0.7249, 0.724, 0.7272, 0.727, 0.7268, 0.7315, 0.7314, 0.7257, 0.7259, 0.7253, 0.7268, 0.7275, 0.7274, 0.7312, 0.7306, 0.7296, 0.7288, 0.7284, 0.729, 0.7285, 0.7297, 0.728, 0.7321, 0.7331, 0.7305, 0.7296, 0.7279, 0.7328, 0.7294, 0.7301, 0.7301, 0.728, 0.727, 0.7285, 0.7303, 0.7283, 0.7334, 0.7339, 0.7319, 0.7312, 0.7296, 0.7324, 0.7291, 0.7283, 0.734, 0.7307, 0.7301, 0.7315, 0.7295, 0.7298, 0.7309, 0.7336, 0.7321, 0.7308, 0.7328, 0.7331, 0.7321, 0.7331, 0.7323, 0.7332, 0.7337, 0.734, 0.7324, 0.7315, 0.7315, 0.7307, 0.7284, 0.7304, 0.7312, 0.7341, 0.7304, 0.7293, 0.7342, 0.7327, 0.734, 0.7324, 0.7334, 0.7339, 0.7339, 0.7334, 0.7323, 0.7316, 0.7312, 0.7325, 0.732, 0.7335, 0.7316, 0.7307, 0.7322, 0.7347, 0.733, 0.7336, 0.7341, 0.7343, 0.7328, 0.7323, 0.7338, 0.7319, 0.7332, 0.7344, 0.7356, 0.7353, 0.734, 0.7327, 0.7343, 0.7349, 0.7352, 0.7338, 0.7351, 0.7325, 0.7341, 0.7347, 0.7354, 0.7341, 0.733, 0.7344, 0.7353, 0.7348, 0.7353, 0.7344, 0.7348, 0.7326, 0.7342, 0.7359, 0.7367, 0.7352, 0.7359, 0.734, 0.7378, 0.7392, 0.7375, 0.7378, 0.738, 0.7369, 0.7349, 0.7393, 0.7369, 0.7368, 0.7346, 0.735, 0.7388, 0.7393, 0.7384, 0.737, 0.7376, 0.7377, 0.7377, 0.7378, 0.7386, 0.7356, 0.7387, 0.7368, 0.7343, 0.7357, 0.736, 0.7375, 0.7372, 0.7375, 0.7363, 0.7371, 0.7363, 0.7387, 0.7408, 0.7381, 0.7383, 0.7389, 0.7381, 0.74, 0.7401, 0.7384, 0.7383, 0.7374, 0.7371, 0.7372, 0.7374, 0.737, 0.7385, 0.7376, 0.7374, 0.7366, 0.7384, 0.738, 0.7398, 0.7404, 0.7376, 0.7393, 0.7368, 0.7375, 0.738, 0.7365, 0.7394, 0.7353, 0.7363, 0.7372, 0.7367, 0.7355, 0.7356, 0.7373, 0.7381, 0.7381, 0.7378, 0.7393, 0.7378, 0.7382, 0.7364, 0.7387, 0.7382, 0.7392, 0.7385, 0.7401, 0.7393, 0.7383, 0.7377, 0.7399, 0.7406, 0.7404, 0.7389, 0.7387, 0.7386, 0.7382, 0.7394, 0.738, 0.7362, 0.7406, 0.7411, 0.7417, 0.7393, 0.7399, 0.7385, 0.7385, 0.7385, 0.7409, 0.7395, 0.741, 0.7392, 0.739, 0.74, 0.7405, 0.7396, 0.741, 0.7406, 0.7397, 0.7392, 0.7397, 0.738, 0.7397, 0.7399, 0.7391, 0.7423, 0.74, 0.7407, 0.7392, 0.7398, 0.7381, 0.739, 0.7394, 0.7412, 0.738, 0.7368, 0.7393, 0.7371, 0.7381, 0.736, 0.7382, 0.7389, 0.7366, 0.7368, 0.7382, 0.7395, 0.7394, 0.7378, 0.7391, 0.7392, 0.7402, 0.7404, 0.7395, 0.7394, 0.7387, 0.7385, 0.7377, 0.7387, 0.7381, 0.7398, 0.7388, 0.7405, 0.7413, 0.7409, 0.7398, 0.7371, 0.739, 0.7395, 0.7386, 0.7384, 0.7391, 0.7391, 0.7391, 0.7384, 0.7389, 0.7387, 0.7393, 0.7389, 0.7391, 0.7396, 0.7399, 0.739, 0.7393, 0.7388, 0.7391, 0.7396, 0.7391, 0.7398, 0.7391, 0.7381, 0.7389, 0.7384, 0.7398, 0.7387, 0.739, 0.7392, 0.7394, 0.7393, 0.7386, 0.7395, 0.7396, 0.7388, 0.7412, 0.739, 0.74, 0.74, 0.741, 0.7397, 0.7405, 0.7405, 0.7395, 0.7391, 0.74, 0.7406, 0.7403, 0.7401, 0.7397, 0.7398, 0.7404, 0.7401, 0.7395, 0.74, 0.7403, 0.7413, 0.74, 0.7403, 0.7397, 0.7398, 0.7395, 0.7394, 0.7388, 0.7398, 0.7398, 0.7395, 0.7401, 0.7398, 0.7396, 0.7398, 0.7401, 0.741, 0.7411, 0.7393, 0.74, 0.7393, 0.7398, 0.7392, 0.7394, 0.7391, 0.7396, 0.7402, 0.7392, 0.7395, 0.7399, 0.7395, 0.7391, 0.7388, 0.7402, 0.7407, 0.7406, 0.7404, 0.7411, 0.741, 0.7405, 0.7402, 0.7404, 0.741, 0.7401, 0.74, 0.7412, 0.7399, 0.7404, 0.7405, 0.7405, 0.7412, 0.7411, 0.7406, 0.7403, 0.7405, 0.7401, 0.7404, 0.7401, 0.7408, 0.7408, 0.7408, 0.7407, 0.741, 0.7404, 0.7404, 0.7408, 0.7406, 0.7406, 0.7401, 0.741, 0.741, 0.7419, 0.7414, 0.7409, 0.7416, 0.7407, 0.7413, 0.7412, 0.7418, 0.7419, 0.7413, 0.7411, 0.7412, 0.7408, 0.7409, 0.7403, 0.74, 0.7405, 0.7406, 0.7412, 0.742, 0.7421, 0.7412, 0.7415, 0.7418, 0.7423, 0.7418, 0.7415, 0.7415, 0.741, 0.7411, 0.7416, 0.7411, 0.7409, 0.7418, 0.742, 0.7415, 0.7421, 0.7407, 0.7415, 0.742, 0.7413, 0.7416, 0.742, 0.742, 0.7416, 0.7419, 0.7415, 0.7411, 0.7424, 0.7425, 0.7421, 0.7422, 0.7422, 0.7423, 0.7426, 0.7419, 0.7423, 0.7425, 0.7421, 0.7422, 0.7428, 0.7421, 0.7423, 0.7422, 0.7419, 0.7425, 0.7423, 0.7414, 0.7417, 0.742, 0.7412, 0.7421, 0.7426, 0.7421, 0.7424, 0.7419, 0.742, 0.7427, 0.7419, 0.743, 0.7428, 0.7426, 0.7421, 0.7418, 0.7422, 0.7427, 0.7416, 0.7424, 0.743, 0.7424, 0.7421, 0.7429, 0.743, 0.7434, 0.743, 0.7424, 0.7424, 0.7426, 0.7431, 0.7433, 0.7426, 0.7423, 0.7428, 0.743, 0.7435, 0.743, 0.7432, 0.7432, 0.7432, 0.7432, 0.7435, 0.7428, 0.7438, 0.7437, 0.7434, 0.7434, 0.7424, 0.7438, 0.7434, 0.7432, 0.7426, 0.7429, 0.7429, 0.743, 0.7437, 0.7439, 0.7437, 0.7437, 0.744, 0.7441, 0.7441, 0.7438, 0.7435, 0.7437, 0.7434, 0.7437, 0.7439, 0.7437, 0.7441, 0.7441, 0.744, 0.7439, 0.7444, 0.7439, 0.7443, 0.7434, 0.7435, 0.744, 0.7438, 0.7434, 0.7431, 0.7433, 0.7435, 0.7435, 0.7441, 0.7433, 0.7437, 0.7437, 0.7437, 0.7437, 0.7437, 0.7437, 0.7433, 0.7435, 0.7436, 0.7435, 0.7435, 0.7438, 0.7439, 0.7433, 0.7434, 0.7432, 0.7429, 0.7432, 0.7432, 0.7439, 0.744, 0.7437, 0.7437, 0.744, 0.744, 0.7438, 0.7439, 0.7438, 0.7435, 0.7438, 0.7439, 0.7439, 0.7439, 0.7441, 0.7436, 0.7444, 0.7446, 0.7443, 0.744, 0.7442, 0.7438, 0.7441, 0.7442, 0.7447, 0.744, 0.7447, 0.7448, 0.7443, 0.744, 0.744, 0.7446, 0.7442, 0.7444, 0.7445, 0.7443, 0.7448, 0.7442, 0.7441, 0.7438, 0.7442, 0.7446, 0.7444, 0.7445, 0.7441, 0.7445, 0.744, 0.7448, 0.7447, 0.7446, 0.7444, 0.7447, 0.7458, 0.7453, 0.7454, 0.7453, 0.7454, 0.7452, 0.7451, 0.7455, 0.7452, 0.7456, 0.7454, 0.7454, 0.7452, 0.7449, 0.745, 0.7458, 0.7457, 0.7459, 0.7457, 0.746, 0.746, 0.7458, 0.7459, 0.7458, 0.7458, 0.746, 0.7459, 0.7465, 0.7464, 0.7461, 0.7465, 0.7466, 0.7462, 0.7468, 0.7473, 0.7471, 0.7475, 0.7476, 0.7473, 0.7471, 0.7466, 0.7469, 0.7476, 0.7476, 0.7474, 0.7473, 0.7469, 0.7472, 0.7471, 0.7469, 0.7474, 0.747, 0.747, 0.747, 0.7472, 0.747, 0.7469, 0.7468, 0.7466, 0.7471, 0.747, 0.7472, 0.7468, 0.7468, 0.7465, 0.7467, 0.7465, 0.7464, 0.7466, 0.7467, 0.7464, 0.7463, 0.7463, 0.7462, 0.7459, 0.7457, 0.746, 0.7462, 0.7461, 0.746, 0.7461, 0.7462, 0.746, 0.7458, 0.7458, 0.7456, 0.7455, 0.7458, 0.7456, 0.7458, 0.7457, 0.7457, 0.7455, 0.7454, 0.7454, 0.7457, 0.7455, 0.7456, 0.7455, 0.7453, 0.7456, 0.7454, 0.7452, 0.7452, 0.7454, 0.7453, 0.7452, 0.7451, 0.7454, 0.7451, 0.7451, 0.7453, 0.7451, 0.7452, 0.7454, 0.7453, 0.7454, 0.7456, 0.7455, 0.7456, 0.7456, 0.7455, 0.746, 0.7458, 0.7459, 0.7459, 0.7463, 0.7462, 0.7461, 0.7462, 0.7459, 0.7459, 0.7461, 0.7461, 0.7462, 0.7461, 0.7462, 0.7462, 0.7462, 0.7461, 0.7463, 0.7464, 0.7464, 0.7464, 0.7462, 0.7461, 0.7463, 0.7467, 0.7464, 0.7464, 0.7465, 0.7467, 0.7466, 0.7465, 0.7463, 0.7465, 0.7465, 0.7467, 0.7465, 0.7466, 0.7464, 0.7463, 0.7463, 0.7462, 0.7461, 0.746, 0.746, 0.746, 0.7459, 0.7459, 0.7461, 0.7461, 0.7459, 0.7459, 0.7459, 0.7461, 0.7459, 0.746, 0.7459, 0.7458, 0.7458, 0.7458, 0.7457, 0.746, 0.746, 0.7463, 0.7462, 0.746, 0.7463, 0.7463, 0.7462, 0.7462, 0.7459, 0.746, 0.746, 0.746, 0.7459, 0.7461, 0.7464, 0.7459, 0.7459, 0.746, 0.7462, 0.7464, 0.7465, 0.7467, 0.7466, 0.7467, 0.7468, 0.7469, 0.7469, 0.7469, 0.7466, 0.747, 0.7468, 0.7469, 0.7466, 0.7466, 0.7468, 0.747, 0.7467, 0.747, 0.7468, 0.7467, 0.7466, 0.7467, 0.7468, 0.7468, 0.7469, 0.7469, 0.7469, 0.747, 0.7471, 0.7472, 0.7472, 0.7472, 0.7472, 0.7472, 0.7472, 0.7472, 0.7471, 0.7471, 0.7471, 0.7473, 0.7473, 0.7473, 0.7473, 0.7469, 0.7469, 0.7469, 0.7469, 0.7469, 0.7469, 0.7472, 0.7471, 0.7471, 0.7471, 0.7471, 0.7471, 0.7471, 0.7471, 0.7471, 0.7472, 0.7471, 0.747, 0.7469, 0.7469, 0.7469, 0.7469, 0.7469, 0.7469, 0.747, 0.7472, 0.7472, 0.7472, 0.7472, 0.7472, 0.7472, 0.7472, 0.7473, 0.7473, 0.7472, 0.7473, 0.7473, 0.7475, 0.7474, 0.7474, 0.7475, 0.7474, 0.7476, 0.7476, 0.7476, 0.7476, 0.7476, 0.7476, 0.7475, 0.7476]
+    print(len(l1))
+    print(l[:1054])
